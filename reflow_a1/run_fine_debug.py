@@ -143,6 +143,24 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["none", "init", "fixed"],
         help="Fine-stage camera anchor mode; fixed is recommended for stable debug registry updates",
     )
+    parser.add_argument(
+        "--fine_coarse_pointmap_teacher_weight",
+        default=0.1,
+        type=float,
+        help="Fine-stage coarse/canonical pointmap teacher loss weight for keyframe and overlap anchors",
+    )
+    parser.add_argument(
+        "--fine_coarse_depth_teacher_weight",
+        default=0.05,
+        type=float,
+        help="Fine-stage coarse/canonical depth teacher loss weight for keyframe and overlap anchors",
+    )
+    parser.add_argument(
+        "--fine_coarse_teacher_min_confidence",
+        default=3.0,
+        type=float,
+        help="Minimum anchor confidence for coarse/canonical geometry teacher pixels",
+    )
 
     parser.add_argument("--force_recompute_pairs", action="store_true", help="Ignore pair cache and recompute")
     parser.add_argument("--max_frames", default=None, type=int, help="Optional debugging cap on split frames")
@@ -933,9 +951,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     evo_fallback = _ensure_writable_evo_home(scene_root)
     if evo_fallback is not None:
         print(f"[Init] HOME is read-only; using writable HOME={evo_fallback}")
+    keyframe_lock_policy = "post_sim3=disabled, coarse_init+teacher_geometry=enabled"
     print(
         "[Init] Camera policy: coarse=fixed_to_source_colmap(intrinsics+extrinsics), "
-        f"fine_anchor_mode={args.fine_camera_anchor_mode} + keyframe_locked_to_coarse"
+        f"fine_anchor_mode={args.fine_camera_anchor_mode} + {keyframe_lock_policy}"
     )
 
     dataset = SceneDatadirDataset(
@@ -1110,7 +1129,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"temporal_smooth={args.fine_temporal_smoothing_weight}, "
         f"pose_prior={args.fine_camera_pose_prior_weight}, "
         f"intr_prior={args.fine_camera_intrinsics_prior_weight}, "
-        f"pose_prior_t={args.fine_camera_pose_prior_translation_weight})"
+        f"pose_prior_t={args.fine_camera_pose_prior_translation_weight}, "
+        f"coarse_point_teacher={args.fine_coarse_pointmap_teacher_weight}, "
+        f"coarse_depth_teacher={args.fine_coarse_depth_teacher_weight}, "
+        f"teacher_min_conf={args.fine_coarse_teacher_min_confidence})"
     )
 
     fine_clip_states: List[Dict[str, Any]] = []
@@ -1136,6 +1158,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             camera_intrinsics_prior_weight=args.fine_camera_intrinsics_prior_weight,
             camera_pose_prior_translation_weight=args.fine_camera_pose_prior_translation_weight,
             camera_anchor_mode=args.fine_camera_anchor_mode,
+            previous_aligned_state=fine_clip_states[-1] if fine_clip_states else None,
+            coarse_pointmap_teacher_weight=args.fine_coarse_pointmap_teacher_weight,
+            coarse_depth_teacher_weight=args.fine_coarse_depth_teacher_weight,
+            coarse_teacher_min_confidence=args.fine_coarse_teacher_min_confidence,
             force_recompute_pairs=args.force_recompute_pairs,
             verbose=True,
         )
@@ -1170,6 +1196,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "frame_ids": list(clip),
                 "num_fine_pairs": int(len(pairs)),
                 "alignment_loss": clip_state.get("alignment_loss"),
+                "fine_coarse_initialization": clip_state.get("fine_coarse_initialization", {}),
+                "coarse_geometry_teacher": clip_state.get("coarse_geometry_teacher", {}),
                 "static_update": static_update_meta,
                 "dynamic_update": dynamic_update_meta,
             }
@@ -1186,9 +1214,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     fine_state["debug_graph_clip_indices"] = debug_clip_indices
     fine_state["debug_clip_frame_ids"] = debug_clips
     fine_state["keyframe_pose_lock"] = {
-        "enabled": bool(fine_clip_states)
-        and all(bool(state.get("keyframe_pose_lock", {}).get("enabled")) for state in fine_clip_states),
-        "camera_source": "coarse_fixed_source_colmap",
+        "enabled": False,
+        "camera_source": "coarse_initialization_plus_teacher_loss",
+        "reason": "post_alignment_disabled_no_sim3_or_rigid_keyframe_retarget",
         "clips": [dict(state.get("keyframe_pose_lock", {})) for state in fine_clip_states],
     }
     fine_state["global_static_map_summary"] = static_map.summary()
@@ -1313,11 +1341,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "fine_camera_pose_prior_weight": float(args.fine_camera_pose_prior_weight),
             "fine_camera_intrinsics_prior_weight": float(args.fine_camera_intrinsics_prior_weight),
             "fine_camera_pose_prior_translation_weight": float(args.fine_camera_pose_prior_translation_weight),
+            "fine_coarse_pointmap_teacher_weight": float(args.fine_coarse_pointmap_teacher_weight),
+            "fine_coarse_depth_teacher_weight": float(args.fine_coarse_depth_teacher_weight),
+            "fine_coarse_teacher_min_confidence": float(args.fine_coarse_teacher_min_confidence),
             "dynamic_min_confidence": float(args.dynamic_min_confidence),
             "fine_voxel_keep_max_conf": bool(args.fine_voxel_keep_max_conf),
             "fine_voxel_size": float(args.fine_voxel_size),
             "global_static_voxel_size": float(global_static_voxel_size),
-            "camera_policy": f"fine_camera_anchor_mode={args.fine_camera_anchor_mode}",
+            "camera_policy": (
+                f"fine_camera_anchor_mode={args.fine_camera_anchor_mode}, "
+                "post_sim3_disabled, coarse_keyframe_and_overlap_init"
+            ),
             "global_registry_policy": "sequential_fine_static_fusion_plus_per_frame_best_dynamic_buffer",
         },
         "coarse": {
@@ -1341,6 +1375,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "alignment_loss": fine_state.get("alignment_loss"),
             "camera_anchor_mode": fine_state.get("camera_anchor_mode"),
             "poses_fixed_to_source": bool(fine_state.get("poses_fixed_to_source", False)),
+            "poses_fixed_to_initialization": bool(fine_state.get("poses_fixed_to_initialization", False)),
             "keyframe_pose_lock": fine_state.get("keyframe_pose_lock", {}),
             "debug_clip_updates": fine_clip_update_meta,
             "pose_error_vs_source_colmap": {

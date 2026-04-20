@@ -324,12 +324,12 @@ This writes:
 For step-by-step validation with only `coarse + first clip fine`, run:
 
 ```bash
-CUDA_VISIBLE_DEVICES=3 python run_fine_debug.py \
+CUDA_VISIBLE_DEVICES=0 python run_fine_debug.py \
   --scene_root /mnt/store/fd/project/dataset/HyperNeRF/vrig/broom-single \
   --clip_len 10 \
   --coarse_max_offset 9 \
   --overlap_frames 4 \
-  --num_fine_debug_clips 2 \
+  --num_fine_debug_clips 1 \
   --weights /mnt/store/fd/project/DynamicReconstruction/monst3r/ckpt/model.safetensors \
   --niter_coarse 1500 \
   --lr 0.05 \
@@ -337,7 +337,7 @@ CUDA_VISIBLE_DEVICES=3 python run_fine_debug.py \
   --lr_fine 0.02 \
   --fine_camera_anchor_mode fixed \
   --dynamic_min_confidence 5.0 \
-  --output_dir /mnt/store/fd/project/dataset/HyperNeRF/vrig/broom-single/monst3r_reflow_a1_fine_debug
+  --output_dir /mnt/store/fd/project/dataset/HyperNeRF/vrig/broom-single/monst3r_reflow_a1_fine_debug_v2
 ```
 
 This writes:

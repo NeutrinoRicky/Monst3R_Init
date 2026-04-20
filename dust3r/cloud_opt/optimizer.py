@@ -37,6 +37,8 @@ class PointCloudOptimizer(BasePCOptimizer):
                  depth_regularize_weight=0.0, num_total_iter=300, temporal_smoothing_weight=0, translation_weight=0.1,
                  camera_pose_prior_weight=0.0, camera_intrinsics_prior_weight=0.0,
                  camera_pose_prior_translation_weight=1.0, camera_intrinsics_pp_prior_weight=1.0,
+                 coarse_pointmap_teacher=None, coarse_depth_teacher=None, coarse_geometry_teacher_mask=None,
+                 coarse_pointmap_teacher_weight=0.0, coarse_depth_teacher_weight=0.0,
                  flow_loss_start_epoch=0.15, flow_loss_thre=50,
                  sintel_ckpt=False, use_self_mask=False, pxl_thre=50, sam2_mask_refine=True, motion_mask_thre=0.35, batchify=True,
                  window_wise=False, window_size=100, window_overlap_ratio=0.5, prev_video_results=None, **kwargs):
@@ -81,6 +83,13 @@ class PointCloudOptimizer(BasePCOptimizer):
             dtype=torch.float32,
         ))
         self._setup_camera_prior_targets()
+        self.coarse_pointmap_teacher_weight = float(coarse_pointmap_teacher_weight)
+        self.coarse_depth_teacher_weight = float(coarse_depth_teacher_weight)
+        self._setup_coarse_geometry_teacher(
+            coarse_pointmap_teacher,
+            coarse_depth_teacher,
+            coarse_geometry_teacher_mask,
+        )
 
         # adding thing to global optimization
         if self.batchify:
@@ -250,6 +259,114 @@ class PointCloudOptimizer(BasePCOptimizer):
         diag = torch.clamp(image_diag.to(device=pp_current.device, dtype=pp_current.dtype), min=1e-6).unsqueeze(-1)
         pp_loss = torch.norm((pp_current - pp_target) / diag, dim=1).mean()
         return focal_loss + self.camera_intrinsics_pp_prior_weight * pp_loss
+
+    def _setup_coarse_geometry_teacher(self, pointmaps=None, depthmaps=None, masks=None):
+        n_imgs = int(self.n_imgs)
+        pointmaps = [None] * n_imgs if pointmaps is None else list(pointmaps)
+        depthmaps = [None] * n_imgs if depthmaps is None else list(depthmaps)
+        masks = [None] * n_imgs if masks is None else list(masks)
+        if len(pointmaps) != n_imgs:
+            pointmaps = (pointmaps + [None] * n_imgs)[:n_imgs]
+        if len(depthmaps) != n_imgs:
+            depthmaps = (depthmaps + [None] * n_imgs)[:n_imgs]
+        if len(masks) != n_imgs:
+            masks = (masks + [None] * n_imgs)[:n_imgs]
+
+        teacher_points = []
+        teacher_depths = []
+        point_masks = []
+        depth_masks = []
+        point_frames = 0
+        depth_frames = 0
+
+        for idx, (H, W) in enumerate(self.imshapes):
+            point = torch.zeros((self.max_area, 3), dtype=torch.float32)
+            depth = torch.zeros((self.max_area,), dtype=torch.float32)
+            point_mask = torch.zeros((self.max_area,), dtype=torch.bool)
+            depth_mask = torch.zeros((self.max_area,), dtype=torch.bool)
+
+            base_mask = None
+            if masks[idx] is not None:
+                mask_t = torch.as_tensor(masks[idx], dtype=torch.bool)
+                if tuple(mask_t.shape[:2]) == (H, W):
+                    base_mask = mask_t
+
+            if pointmaps[idx] is not None:
+                point_t = torch.as_tensor(pointmaps[idx], dtype=torch.float32)
+                if tuple(point_t.shape[:2]) == (H, W) and point_t.shape[-1] == 3:
+                    valid = torch.isfinite(point_t).all(dim=-1)
+                    if base_mask is not None:
+                        valid = valid & base_mask
+                    point = _ravel_hw(point_t, self.max_area)
+                    point_mask = _ravel_hw(valid, self.max_area)
+                    point_frames += int(bool(point_mask.any()))
+
+            if depthmaps[idx] is not None:
+                depth_t = torch.as_tensor(depthmaps[idx], dtype=torch.float32)
+                if tuple(depth_t.shape[:2]) == (H, W):
+                    valid = torch.isfinite(depth_t) & (depth_t > 0)
+                    if base_mask is not None:
+                        valid = valid & base_mask
+                    safe_depth = depth_t.clone()
+                    if bool(valid.any()):
+                        fill = torch.median(safe_depth[valid])
+                        safe_depth[~valid] = fill
+                    else:
+                        safe_depth[:] = 1.0
+                    depth = _ravel_hw(safe_depth, self.max_area)
+                    depth_mask = _ravel_hw(valid, self.max_area)
+                    depth_frames += int(bool(depth_mask.any()))
+
+            teacher_points.append(point)
+            teacher_depths.append(depth)
+            point_masks.append(point_mask)
+            depth_masks.append(depth_mask)
+
+        self.register_buffer('_coarse_pointmap_teacher', torch.stack(teacher_points, dim=0))
+        self.register_buffer('_coarse_depth_teacher', torch.stack(teacher_depths, dim=0))
+        self.register_buffer('_coarse_pointmap_teacher_mask', torch.stack(point_masks, dim=0))
+        self.register_buffer('_coarse_depth_teacher_mask', torch.stack(depth_masks, dim=0))
+        self.coarse_pointmap_teacher_frames = int(point_frames)
+        self.coarse_depth_teacher_frames = int(depth_frames)
+
+    def _as_raw_stack(self, value):
+        if isinstance(value, (list, tuple)):
+            return torch.stack([_ravel_hw(v, self.max_area) for v in value], dim=0)
+        return value
+
+    def _coarse_geometry_teacher_loss(self, current_pts3d, current_depths, start=0, end=None):
+        current_pts3d = self._as_raw_stack(current_pts3d)
+        current_depths = self._as_raw_stack(current_depths)
+        zero = current_pts3d.sum() * 0.0
+        if end is None:
+            end = start + int(current_pts3d.shape[0])
+
+        point_loss = zero
+        if (
+            self.coarse_pointmap_teacher_weight > 0
+            and self._coarse_pointmap_teacher.numel() > 0
+            and self.coarse_pointmap_teacher_frames > 0
+        ):
+            target = self._coarse_pointmap_teacher[start:end].to(device=current_pts3d.device, dtype=current_pts3d.dtype)
+            mask = self._coarse_pointmap_teacher_mask[start:end].to(device=current_pts3d.device)
+            if bool(mask.any()):
+                point_error = torch.linalg.norm(current_pts3d - target, dim=-1)
+                point_loss = point_error[mask].mean()
+
+        depth_loss = zero
+        if (
+            self.coarse_depth_teacher_weight > 0
+            and self._coarse_depth_teacher.numel() > 0
+            and self.coarse_depth_teacher_frames > 0
+        ):
+            target_depth = self._coarse_depth_teacher[start:end].to(device=current_depths.device, dtype=current_depths.dtype)
+            mask = self._coarse_depth_teacher_mask[start:end].to(device=current_depths.device)
+            if bool(mask.any()):
+                current = torch.clamp(current_depths[mask], min=1e-6)
+                target = torch.clamp(target_depth[mask], min=1e-6)
+                depth_loss = torch.abs(torch.log(current / target)).mean()
+
+        return point_loss, depth_loss
             
     def _get_window_bounds(self, window_idx):
         """Get the window interval and the optimized interval"""
@@ -899,6 +1016,7 @@ class PointCloudOptimizer(BasePCOptimizer):
         else:    
             flow_loss = 0
 
+        current_depthmaps_raw = self.get_depthmaps(raw=True)
         if self.depth_regularize_weight > 0:
             init_depthmaps = torch.stack(self.get_init_depthmaps(raw=False)).unsqueeze(1)
             depthmaps = torch.stack(self.get_depthmaps(raw=False)).unsqueeze(1)
@@ -906,11 +1024,17 @@ class PointCloudOptimizer(BasePCOptimizer):
             depth_prior_loss = self.depth_regularizer(depthmaps, init_depthmaps, dynamic_masks_all)
         else:
             depth_prior_loss = 0
+        coarse_pointmap_loss, coarse_depth_loss = self._coarse_geometry_teacher_loss(
+            proj_pts3d,
+            current_depthmaps_raw,
+        )
 
         loss = (li + lj) * 1 + self.temporal_smoothing_weight * temporal_smoothing_loss + \
                 self.flow_loss_weight * flow_loss + self.depth_regularize_weight * depth_prior_loss + \
                 self.camera_pose_prior_weight * pose_prior_loss + \
-                self.camera_intrinsics_prior_weight * intrinsics_prior_loss
+                self.camera_intrinsics_prior_weight * intrinsics_prior_loss + \
+                self.coarse_pointmap_teacher_weight * coarse_pointmap_loss + \
+                self.coarse_depth_teacher_weight * coarse_depth_loss
 
         return loss, flow_loss
     
@@ -978,6 +1102,7 @@ class PointCloudOptimizer(BasePCOptimizer):
         else:    
             flow_loss = 0
 
+        current_depthmaps_raw = self.get_win_depthmaps(raw=True)
         if self.depth_regularize_weight > 0:
             init_depthmaps = torch.stack(self.get_win_init_depthmaps(raw=False)).unsqueeze(1)
             depthmaps = torch.stack(self.get_win_depthmaps(raw=False)).unsqueeze(1)
@@ -985,11 +1110,19 @@ class PointCloudOptimizer(BasePCOptimizer):
             depth_prior_loss = self.depth_regularizer(depthmaps, init_depthmaps, dynamic_masks_all)
         else:
             depth_prior_loss = 0
+        coarse_pointmap_loss, coarse_depth_loss = self._coarse_geometry_teacher_loss(
+            proj_pts3d,
+            current_depthmaps_raw,
+            start=win_start,
+            end=win_end,
+        )
 
         loss = (li + lj) * 1 + self.temporal_smoothing_weight * temporal_smoothing_loss + \
                 self.flow_loss_weight * flow_loss + self.depth_regularize_weight * depth_prior_loss + \
                 self.camera_pose_prior_weight * pose_prior_loss + \
-                self.camera_intrinsics_prior_weight * intrinsics_prior_loss
+                self.camera_intrinsics_prior_weight * intrinsics_prior_loss + \
+                self.coarse_pointmap_teacher_weight * coarse_pointmap_loss + \
+                self.coarse_depth_teacher_weight * coarse_depth_loss
         
         return loss, flow_loss
     
@@ -1120,6 +1253,13 @@ class PointCloudOptimizer(BasePCOptimizer):
                     self.dynamic_masks[i].unsqueeze(0).unsqueeze(1)
                 )
             loss += self.depth_regularize_weight * depth_prior_loss
+
+        coarse_pointmap_loss, coarse_depth_loss = self._coarse_geometry_teacher_loss(
+            proj_pts3d,
+            self.get_depthmaps(raw=False),
+        )
+        loss += self.coarse_pointmap_teacher_weight * coarse_pointmap_loss
+        loss += self.coarse_depth_teacher_weight * coarse_depth_loss
 
         return loss, flow_loss
 
