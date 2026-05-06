@@ -427,6 +427,9 @@ def run_fine_alignment(
                 f"depth_teacher_frames={meta['num_depth_teacher_frames']}"
             )
 
+        # Anchor frames from coarse stage: freeze their depth and inherit pointmaps
+        anchor_frozen_frame_ids = list(fine_init["meta"]["coarse_anchor_frame_ids"])
+
         local_state = run_monst3r_alignment(
             dataset=dataset,
             frame_ids=clip,
@@ -441,7 +444,7 @@ def run_fine_alignment(
             camera_pose_prior_translation_weight=camera_pose_prior_translation_weight,
             use_camera_anchor=True,
             camera_anchor_mode=fine_camera_mode,
-            static_only_loss=False,
+            static_only_loss=True,
             camera_init_poses=fine_init["camera_init_poses"],
             camera_init_intrinsics=fine_init["camera_init_intrinsics"],
             depth_initialization=fine_init["depth_initialization"],
@@ -450,6 +453,7 @@ def run_fine_alignment(
             coarse_geometry_teacher_mask=fine_init["geometry_teacher_mask"],
             coarse_pointmap_teacher_weight=coarse_pointmap_teacher_weight,
             coarse_depth_teacher_weight=coarse_depth_teacher_weight,
+            frozen_depth_frame_ids=anchor_frozen_frame_ids,
             force_recompute_pairs=force_recompute_pairs,
             verbose=verbose,
         )

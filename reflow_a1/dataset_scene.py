@@ -8,6 +8,7 @@ as the direct dynamic-region source: by default non-zero labels are dynamic.
 from __future__ import annotations
 
 import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -23,15 +24,157 @@ class SceneDataError(RuntimeError):
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
 ARRAY_SUFFIXES = (".npy", ".npz")
 
+_COLMAP_CAMERA_MODEL_NUM_PARAMS = {
+    0: 3,
+    1: 4,
+    2: 4,
+    3: 5,
+    4: 8,
+    5: 8,
+    6: 12,
+    7: 5,
+    8: 4,
+    9: 5,
+    10: 12,
+}
+
+_COLMAP_CAMERA_MODEL_NAMES = {
+    0: "SIMPLE_PINHOLE",
+    1: "PINHOLE",
+    2: "SIMPLE_RADIAL",
+    3: "RADIAL",
+    4: "OPENCV",
+    5: "OPENCV_FISHEYE",
+    6: "FULL_OPENCV",
+    7: "FOV",
+    8: "SIMPLE_RADIAL_FISHEYE",
+    9: "RADIAL_FISHEYE",
+    10: "THIN_PRISM_FISHEYE",
+}
+
 
 @dataclass(frozen=True)
 class FrameRecord:
     frame_id: str
     rgb_path: Path
     depth_path: Optional[Path]
-    seg_path: Path
-    camera_path: Path
+    seg_path: Optional[Path]
+    camera_path: Optional[Path]
     track_path: Optional[Path]
+    camera_dict: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class ColmapCamera:
+    id: int
+    model: str
+    width: int
+    height: int
+    params: np.ndarray
+
+
+@dataclass(frozen=True)
+class ColmapImage:
+    id: int
+    qvec: np.ndarray
+    tvec: np.ndarray
+    camera_id: int
+    name: str
+
+
+def _read_next_bytes(fid, num_bytes: int, format_char_sequence: str, endian_character: str = "<") -> tuple[Any, ...]:
+    data = fid.read(num_bytes)
+    return struct.unpack(endian_character + format_char_sequence, data)
+
+
+def _read_colmap_cameras_text(path: Path) -> Dict[int, ColmapCamera]:
+    cameras: Dict[int, ColmapCamera] = {}
+    with path.open("r", encoding="utf-8") as fid:
+        for line in fid:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            elems = line.split()
+            camera_id = int(elems[0])
+            cameras[camera_id] = ColmapCamera(
+                id=camera_id,
+                model=elems[1],
+                width=int(elems[2]),
+                height=int(elems[3]),
+                params=np.array(tuple(map(float, elems[4:])), dtype=np.float32),
+            )
+    return cameras
+
+
+def _read_colmap_images_text(path: Path) -> Dict[int, ColmapImage]:
+    images: Dict[int, ColmapImage] = {}
+    with path.open("r", encoding="utf-8") as fid:
+        while True:
+            line = fid.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            elems = line.split()
+            image_id = int(elems[0])
+            images[image_id] = ColmapImage(
+                id=image_id,
+                qvec=np.array(tuple(map(float, elems[1:5])), dtype=np.float32),
+                tvec=np.array(tuple(map(float, elems[5:8])), dtype=np.float32),
+                camera_id=int(elems[8]),
+                name=elems[9],
+            )
+            fid.readline()
+    return images
+
+
+def _read_colmap_cameras_binary(path: Path) -> Dict[int, ColmapCamera]:
+    cameras: Dict[int, ColmapCamera] = {}
+    with path.open("rb") as fid:
+        num_cameras = _read_next_bytes(fid, 8, "Q")[0]
+        for _ in range(num_cameras):
+            camera_properties = _read_next_bytes(fid, 24, "iiQQ")
+            camera_id = int(camera_properties[0])
+            model_id = int(camera_properties[1])
+            num_params = _COLMAP_CAMERA_MODEL_NUM_PARAMS[model_id]
+            params = _read_next_bytes(fid, 8 * num_params, "d" * num_params)
+            cameras[camera_id] = ColmapCamera(
+                id=camera_id,
+                model=_COLMAP_CAMERA_MODEL_NAMES[model_id],
+                width=int(camera_properties[2]),
+                height=int(camera_properties[3]),
+                params=np.asarray(params, dtype=np.float32),
+            )
+    return cameras
+
+
+def _read_colmap_images_binary(path: Path) -> Dict[int, ColmapImage]:
+    images: Dict[int, ColmapImage] = {}
+    with path.open("rb") as fid:
+        num_images = _read_next_bytes(fid, 8, "Q")[0]
+        for _ in range(num_images):
+            props = _read_next_bytes(fid, 64, "idddddddi")
+            image_id = int(props[0])
+            qvec = np.asarray(props[1:5], dtype=np.float32)
+            tvec = np.asarray(props[5:8], dtype=np.float32)
+            camera_id = int(props[8])
+            chars: List[str] = []
+            current_char = _read_next_bytes(fid, 1, "c")[0]
+            while current_char != b"\x00":
+                chars.append(current_char.decode("utf-8"))
+                current_char = _read_next_bytes(fid, 1, "c")[0]
+            num_points2d = _read_next_bytes(fid, 8, "Q")[0]
+            if num_points2d > 0:
+                fid.seek(24 * num_points2d, 1)
+            images[image_id] = ColmapImage(
+                id=image_id,
+                qvec=qvec,
+                tvec=tvec,
+                camera_id=camera_id,
+                name="".join(chars),
+            )
+    return images
 
 
 def _as_float_array(value: Any, shape: tuple[int, ...], name: str) -> np.ndarray:
@@ -60,6 +203,75 @@ def _homogeneous_from_rt(rotation: np.ndarray, translation: np.ndarray) -> np.nd
     mat[:3, :3] = rotation.astype(np.float32)
     mat[:3, 3] = translation.astype(np.float32)
     return mat
+
+
+def _qvec2rotmat(qvec: np.ndarray) -> np.ndarray:
+    qvec = np.asarray(qvec, dtype=np.float32)
+    return np.array(
+        [
+            [
+                1 - 2 * qvec[2] ** 2 - 2 * qvec[3] ** 2,
+                2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
+                2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2],
+            ],
+            [
+                2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
+                1 - 2 * qvec[1] ** 2 - 2 * qvec[3] ** 2,
+                2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1],
+            ],
+            [
+                2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
+                2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
+                1 - 2 * qvec[1] ** 2 - 2 * qvec[2] ** 2,
+            ],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _colmap_camera_to_K(camera: ColmapCamera) -> np.ndarray:
+    params = np.asarray(camera.params, dtype=np.float32)
+    model = camera.model.upper()
+    if model in {"SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL", "SIMPLE_RADIAL_FISHEYE", "RADIAL_FISHEYE", "FOV"}:
+        fx = fy = float(params[0])
+        cx = float(params[1])
+        cy = float(params[2])
+    elif model in {"PINHOLE", "OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV", "THIN_PRISM_FISHEYE"}:
+        fx = float(params[0])
+        fy = float(params[1])
+        cx = float(params[2])
+        cy = float(params[3])
+    else:
+        raise SceneDataError(f"Unsupported COLMAP camera model: {camera.model}")
+    return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+
+
+def _colmap_image_to_camera_dict(image: ColmapImage, camera: ColmapCamera) -> Dict[str, Any]:
+    R_cw = _qvec2rotmat(image.qvec)
+    t_cw = np.asarray(image.tvec, dtype=np.float32)
+    T_cw = _homogeneous_from_rt(R_cw, t_cw)
+    T_wc = np.linalg.inv(T_cw).astype(np.float32)
+    K = _colmap_camera_to_K(camera)
+    return {
+        "K": K,
+        "T_wc": T_wc,
+        "T_cw": T_cw.astype(np.float32),
+        "width": int(camera.width),
+        "height": int(camera.height),
+        "fx": float(K[0, 0]),
+        "fy": float(K[1, 1]),
+        "cx": float(K[0, 2]),
+        "cy": float(K[1, 2]),
+        "raw": {
+            "image_id": int(image.id),
+            "camera_id": int(camera.id),
+            "image_name": image.name,
+            "qvec": np.asarray(image.qvec, dtype=np.float32),
+            "tvec": np.asarray(image.tvec, dtype=np.float32),
+            "camera_model": camera.model,
+            "camera_params": np.asarray(camera.params, dtype=np.float32),
+        },
+    }
 
 
 def parse_camera_json(camera_path: str | Path) -> Dict[str, Any]:
@@ -286,7 +498,7 @@ class SceneDatadirDataset:
                 ids = split_data.get("ids", split_data.get(key, split_data))
         if ids is None:
             raise SceneDataError(f"Could not find split ids for split={split!r}")
-        return sorted([str(frame_id) for frame_id in ids])
+        return [str(frame_id) for frame_id in ids]
 
     def _resolve_existing(self, relative_candidates: Iterable[str], required: bool = True) -> Optional[Path]:
         tried = []
@@ -325,8 +537,9 @@ class SceneDatadirDataset:
                 if rel not in split_specific:
                     split_specific.append(rel)
 
-        # Keep the original scene_datadir layout as the normal fallback.
-        generic = ["rgb/1x", "rgb/2x", "rgb/4x", "rgb/8x", "rgb/16x", "rgb"]
+        # HyperNeRF's masks live at 2x resolution, so prefer rgb/2x and let
+        # camera intrinsics be scaled to the loaded image size.
+        generic = ["rgb/2x", "rgb/1x", "rgb/4x", "rgb/8x", "rgb/16x", "rgb"]
         return self._existing_dirs([*split_specific, *generic])
 
     def _candidate_paths(
@@ -361,11 +574,12 @@ class SceneDatadirDataset:
         )
         seg_dirs = self._existing_dirs(
             (
+                "mask",
+                "masks",
+                "segmentation/2x",
                 "segmentation/1x",
                 f"segmentation/2x_{self.split}_ids",
                 "segmentation",
-                "mask",
-                "masks",
             )
         )
         seg = self._resolve_existing(self._candidate_paths(seg_dirs, stem_candidates, (*ARRAY_SUFFIXES, *IMAGE_SUFFIXES)))
@@ -464,8 +678,16 @@ class SceneDatadirDataset:
     def _load_record(self, record: FrameRecord) -> Dict[str, Any]:
         rgb = np.asarray(Image.open(record.rgb_path).convert("RGB"))
         depth = None if record.depth_path is None else self._load_depth(record.depth_path)
-        segmentation = self._load_segmentation(record.seg_path)
-        camera = parse_camera_json(record.camera_path)
+        if record.seg_path is None:
+            segmentation = np.zeros(rgb.shape[:2], dtype=np.uint8)
+        else:
+            segmentation = self._load_segmentation(record.seg_path)
+        if record.camera_dict is not None:
+            camera = record.camera_dict
+        elif record.camera_path is not None:
+            camera = parse_camera_json(record.camera_path)
+        else:
+            raise SceneDataError(f"{record.frame_id}: record is missing both camera_path and camera_dict")
         camera = self._scale_camera_to_image(camera, rgb.shape[1], rgb.shape[0], record.frame_id)
         dynamic_mask = dynamic_mask_from_segmentation(
             segmentation,
@@ -486,14 +708,171 @@ class SceneDatadirDataset:
             "frame_id": record.frame_id,
             "rgb_path": str(record.rgb_path),
             "depth_path": str(record.depth_path) if record.depth_path is not None else None,
-            "seg_path": str(record.seg_path),
-            "camera_path": str(record.camera_path),
+            "seg_path": str(record.seg_path) if record.seg_path is not None else None,
+            "camera_path": str(record.camera_path) if record.camera_path is not None else None,
             "track_path": str(record.track_path) if record.track_path is not None else None,
             "rgb": rgb,
             "depth": depth,
             "segmentation": segmentation,
             "dynamic_mask": dynamic_mask.astype(bool),
+            "has_dynamic_mask": bool(record.seg_path is not None),
             "static_mask": ~dynamic_mask.astype(bool),
             "camera_dict": camera,
             "track": track,
         }
+
+
+class ColmapSparseSceneDataset(SceneDatadirDataset):
+    """In-memory scene reader for COLMAP sparse reconstructions plus image folders."""
+
+    def __init__(
+        self,
+        scene_root: str | Path,
+        split: str = "train",
+        dynamic_label_mode: str = "nonzero_is_dynamic",
+        dynamic_label: Optional[int] = None,
+    ) -> None:
+        self.scene_root = Path(scene_root).expanduser().resolve()
+        self.split = split
+        self.dynamic_label_mode = dynamic_label_mode
+        self.dynamic_label = dynamic_label
+
+        if not self.scene_root.exists():
+            raise SceneDataError(f"Scene root does not exist: {self.scene_root}")
+
+        self.dataset_json_path = self.scene_root / "dataset.json"
+        self.dataset_json = {}
+        self.colmap_root = self._resolve_colmap_root()
+        self.colmap_cameras = self._read_colmap_cameras()
+        self.colmap_images = self._read_colmap_images()
+        self._images_by_frame_id = self._index_colmap_images()
+        self.frame_ids = self._read_split_ids(split)
+        self.frames = [self._build_record(frame_id) for frame_id in self.frame_ids]
+        self._by_id = {record.frame_id: record for record in self.frames}
+
+    def _resolve_colmap_root(self) -> Path:
+        candidates = (
+            self.scene_root / "sparse" / "0",
+            self.scene_root / "colmap" / "sparse" / "0",
+        )
+        for candidate in candidates:
+            if candidate.is_dir():
+                return candidate
+        raise SceneDataError(
+            f"Could not find COLMAP sparse model under {self.scene_root}. "
+            "Expected sparse/0 or colmap/sparse/0."
+        )
+
+    def _read_colmap_cameras(self) -> Dict[int, ColmapCamera]:
+        bin_path = self.colmap_root / "cameras.bin"
+        txt_path = self.colmap_root / "cameras.txt"
+        if bin_path.exists():
+            return _read_colmap_cameras_binary(bin_path)
+        if txt_path.exists():
+            return _read_colmap_cameras_text(txt_path)
+        raise SceneDataError(f"Missing COLMAP cameras file under {self.colmap_root}")
+
+    def _read_colmap_images(self) -> Dict[int, ColmapImage]:
+        bin_path = self.colmap_root / "images.bin"
+        txt_path = self.colmap_root / "images.txt"
+        if bin_path.exists():
+            return _read_colmap_images_binary(bin_path)
+        if txt_path.exists():
+            return _read_colmap_images_text(txt_path)
+        raise SceneDataError(f"Missing COLMAP images file under {self.colmap_root}")
+
+    def _index_colmap_images(self) -> Dict[str, ColmapImage]:
+        indexed: Dict[str, ColmapImage] = {}
+        for image in self.colmap_images.values():
+            frame_id = Path(image.name).stem
+            if frame_id in indexed:
+                raise SceneDataError(f"Duplicate COLMAP frame stem {frame_id!r} in {self.colmap_root}")
+            indexed[frame_id] = image
+        return indexed
+
+    def _read_split_ids(self, split: str) -> List[str]:
+        if split not in {"train", "all"}:
+            raise SceneDataError(
+                f"COLMAP fallback scene {self.scene_root} has no split metadata for split={split!r}. "
+                "Use --scene_split train or all."
+            )
+        return sorted(self._images_by_frame_id.keys(), key=self._frame_sort_key)
+
+    @staticmethod
+    def _frame_sort_key(frame_id: str) -> tuple[int, int | str, str]:
+        stem = Path(frame_id).stem
+        if stem.isdigit():
+            return (0, int(stem), frame_id)
+        return (1, stem, frame_id)
+
+    def _colmap_rgb_dirs(self) -> List[str]:
+        return self._existing_dirs(("images_2", "images", "rgb/2x", "rgb/1x", "rgb"))
+
+    def _colmap_seg_dirs(self) -> List[str]:
+        return self._existing_dirs(("mask", "masks", "segmentation/2x", "segmentation/1x", "segmentation"))
+
+    def _build_record(self, frame_id: str) -> FrameRecord:
+        try:
+            image = self._images_by_frame_id[frame_id]
+        except KeyError as exc:
+            raise SceneDataError(f"Unknown COLMAP frame id {frame_id!r}") from exc
+
+        image_name = image.name
+        image_stem = Path(image_name).stem
+        rgb_dirs = self._colmap_rgb_dirs()
+        if not rgb_dirs:
+            raise SceneDataError(f"Could not find an RGB image directory under {self.scene_root}")
+        rgb = self._resolve_existing(
+            [f"{directory}/{image_name}" for directory in rgb_dirs]
+            + list(self._candidate_paths(rgb_dirs, (image_stem,), IMAGE_SUFFIXES))
+        )
+
+        seg_dirs = self._colmap_seg_dirs()
+        seg = None
+        if seg_dirs:
+            seg = self._resolve_existing(
+                [f"{directory}/{image_name}" for directory in seg_dirs]
+                + list(self._candidate_paths(seg_dirs, (image_stem,), (*ARRAY_SUFFIXES, *IMAGE_SUFFIXES))),
+                required=False,
+            )
+
+        camera = self.colmap_cameras.get(image.camera_id)
+        if camera is None:
+            raise SceneDataError(f"Missing COLMAP camera {image.camera_id} referenced by image {image_name}")
+        camera_dict = _colmap_image_to_camera_dict(image, camera)
+        return FrameRecord(
+            frame_id=frame_id,
+            rgb_path=rgb,
+            depth_path=None,
+            seg_path=seg,
+            camera_path=None,
+            track_path=None,
+            camera_dict=camera_dict,
+        )
+
+
+def create_scene_dataset(
+    scene_root: str | Path,
+    split: str = "train",
+    dynamic_label_mode: str = "nonzero_is_dynamic",
+    dynamic_label: Optional[int] = None,
+) -> SceneDatadirDataset:
+    scene_root = Path(scene_root).expanduser().resolve()
+    if (scene_root / "dataset.json").exists():
+        return SceneDatadirDataset(
+            scene_root=scene_root,
+            split=split,
+            dynamic_label_mode=dynamic_label_mode,
+            dynamic_label=dynamic_label,
+        )
+    if (scene_root / "sparse" / "0").is_dir() or (scene_root / "colmap" / "sparse" / "0").is_dir():
+        return ColmapSparseSceneDataset(
+            scene_root=scene_root,
+            split=split,
+            dynamic_label_mode=dynamic_label_mode,
+            dynamic_label=dynamic_label,
+        )
+    raise SceneDataError(
+        f"Could not interpret scene root {scene_root}. "
+        "Expected dataset.json or a COLMAP sparse model under sparse/0."
+    )

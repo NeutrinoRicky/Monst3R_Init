@@ -225,6 +225,7 @@ def preprocess_frame_for_monst3r(
         "instance": str(frame["rgb_path"]),
         "mask": raw_mask,
         "dynamic_mask": dyn_tensor,
+        "has_dynamic_mask": bool(frame.get("has_dynamic_mask", False)),
         "camera_pose": torch.from_numpy(frame["camera_dict"]["T_wc"][None].astype(np.float32)),
         "camera_intrinsics": torch.from_numpy(K[None].astype(np.float32)),
         "orig_shape": np.int32([[height, width]]),

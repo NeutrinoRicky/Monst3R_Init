@@ -335,6 +335,75 @@ def _preset_initial_depthmaps(
     return {"enabled": bool(num_depth > 0), "num_depth_init": int(num_depth), "skipped": skipped}
 
 
+def _reinit_pw_poses_from_current_depths(
+    scene: Any,
+    verbose: bool = True,
+) -> None:
+    """Recompute pairwise poses from current depth-based 3D points.
+
+    After ``init_from_known_poses`` sets pw_poses to be consistent with
+    MonST3R-estimated depths, any subsequent depth overrides (e.g. coarse
+    depth preset via ``_preset_initial_depthmaps``) break that consistency.
+    This function re-aligns every ``pw_poses[e]`` so that
+    ``geotrf(pw_poses[e], pred_i[e])`` matches the current ``proj_pts3d[i]``
+    computed from the (possibly overridden) depth maps and camera poses.
+    """
+
+    import torch
+    from dust3r.cloud_opt.init_im_poses import rigid_points_registration, edge_str
+
+    with torch.no_grad():
+        pts3d = scene.get_pts3d(raw=True)  # (n_imgs, max_area, 3)
+        n_reinit = 0
+        for e, (i, j) in enumerate(scene.edges):
+            i_j = edge_str(i, j)
+            H, W = scene.imshapes[i]
+            pts_i = pts3d[i][:H * W].view(H, W, 3)
+            pred_i = scene.pred_i[i_j]
+            conf_i = scene.conf_i[i_j]
+            s, R, T = rigid_points_registration(pred_i, pts_i, conf=conf_i)
+            scene._set_pose(scene.pw_poses, e, R, T, scale=s)
+            n_reinit += 1
+    if verbose:
+        print(f"[Init] Reinitialized {n_reinit} pw_poses from current depths")
+
+
+def _freeze_anchor_depthmaps(
+    scene: Any,
+    frame_ids: Sequence[str],
+    frozen_depth_frame_ids: Sequence[str],
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Register a gradient hook on scene.im_depthmaps to zero gradients for frozen frames."""
+
+    import torch
+
+    frozen_indices = sorted(
+        {frame_ids.index(fid) for fid in frozen_depth_frame_ids if fid in frame_ids}
+    )
+    if not frozen_indices:
+        return {"enabled": False, "num_frozen": 0, "frozen_indices": [], "frozen_frame_ids": []}
+
+    frozen_set = set(frozen_indices)
+
+    def _zero_frozen_depth_grads(grad: torch.Tensor) -> torch.Tensor:
+        grad = grad.clone()
+        for idx in frozen_set:
+            grad[idx] = 0.0
+        return grad
+
+    scene.im_depthmaps.register_hook(_zero_frozen_depth_grads)
+    frozen_fids = [frame_ids[idx] for idx in frozen_indices]
+    if verbose:
+        print(f"[Freeze] Registered depth freeze hook for {len(frozen_indices)} anchor frame(s): {frozen_fids}")
+    return {
+        "enabled": True,
+        "num_frozen": int(len(frozen_indices)),
+        "frozen_indices": frozen_indices,
+        "frozen_frame_ids": frozen_fids,
+    }
+
+
 def extract_alignment_state(scene: Any, frame_ids: Sequence[str], loss: Optional[Any] = None) -> Dict[str, Any]:
     pts3d = _to_numpy(scene.get_pts3d())
     poses = _to_numpy(scene.get_im_poses())
@@ -342,6 +411,7 @@ def extract_alignment_state(scene: Any, frame_ids: Sequence[str], loss: Optional
     depths = _to_numpy(scene.get_depthmaps())
     masks = _to_numpy(scene.get_masks())
     raw_conf = _to_numpy(list(scene.im_conf))
+    init_conf = _to_numpy(list(scene.init_conf_maps)) if getattr(scene, "init_conf_maps", None) is not None else [None] * len(frame_ids)
     colors = _to_numpy(scene.imgs) if scene.imgs is not None else [None] * len(frame_ids)
     dyn = _to_numpy(scene.dynamic_masks) if scene.dynamic_masks is not None else [None] * len(frame_ids)
 
@@ -352,6 +422,7 @@ def extract_alignment_state(scene: Any, frame_ids: Sequence[str], loss: Optional
         "intrinsics": {},
         "depths": {},
         "confidence": {},
+        "init_confidence": {},
         "colors": {},
         "dynamic_masks": {},
         "valid_masks": {},
@@ -364,6 +435,7 @@ def extract_alignment_state(scene: Any, frame_ids: Sequence[str], loss: Optional
         state["intrinsics"][frame_id] = np.asarray(intrinsics[idx], dtype=np.float32)
         state["depths"][frame_id] = np.asarray(depths[idx], dtype=np.float32)
         state["confidence"][frame_id] = np.asarray(raw_conf[idx], dtype=np.float32)
+        state["init_confidence"][frame_id] = None if init_conf[idx] is None else np.asarray(init_conf[idx], dtype=np.float32)
         state["colors"][frame_id] = None if colors[idx] is None else np.asarray(colors[idx], dtype=np.float32)
         state["dynamic_masks"][frame_id] = None if dyn[idx] is None else np.asarray(dyn[idx]).astype(bool)
         state["valid_masks"][frame_id] = np.asarray(masks[idx]).astype(bool)
@@ -393,6 +465,7 @@ def run_monst3r_alignment(
     coarse_geometry_teacher_mask: Optional[Mapping[str, np.ndarray]] = None,
     coarse_pointmap_teacher_weight: float = 0.0,
     coarse_depth_teacher_weight: float = 0.0,
+    frozen_depth_frame_ids: Optional[Sequence[str]] = None,
     force_recompute_pairs: bool = False,
     verbose: bool = True,
 ) -> Dict[str, Any]:
@@ -480,6 +553,10 @@ def run_monst3r_alignment(
     known_poses: List[np.ndarray] = []
     if resolved_camera_anchor_mode in ("init", "fixed"):
         known_intrinsics, known_poses = _known_camera_inputs(batch, frame_ids)
+
+    frozen_depth_meta: Dict[str, Any] = {"enabled": False, "num_frozen": 0}
+    _resolved_frozen = list(frozen_depth_frame_ids) if frozen_depth_frame_ids else []
+
     if resolved_camera_anchor_mode == "init":
         import dust3r.cloud_opt.init_im_poses as init_fun
 
@@ -487,6 +564,10 @@ def run_monst3r_alignment(
         scene.preset_pose(known_poses, requires_grad=True)
         init_fun.init_from_known_poses(scene, min_conf_thr=scene.min_conf_thr)
         depth_init_meta = _preset_initial_depthmaps(scene, frame_ids, depth_initialization)
+        if depth_init_meta.get("num_depth_init", 0) > 0:
+            _reinit_pw_poses_from_current_depths(scene, verbose=verbose)
+        if _resolved_frozen:
+            frozen_depth_meta = _freeze_anchor_depthmaps(scene, frame_ids, _resolved_frozen, verbose=verbose)
         loss = scene.compute_global_alignment(init=None, niter=int(niter), schedule=schedule, lr=lr)
     elif resolved_camera_anchor_mode == "fixed":
         import dust3r.cloud_opt.init_im_poses as init_fun
@@ -495,15 +576,33 @@ def run_monst3r_alignment(
         scene.preset_pose(known_poses, requires_grad=False)
         init_fun.init_from_known_poses(scene, min_conf_thr=scene.min_conf_thr)
         depth_init_meta = _preset_initial_depthmaps(scene, frame_ids, depth_initialization)
+        if depth_init_meta.get("num_depth_init", 0) > 0:
+            _reinit_pw_poses_from_current_depths(scene, verbose=verbose)
+        if _resolved_frozen:
+            frozen_depth_meta = _freeze_anchor_depthmaps(scene, frame_ids, _resolved_frozen, verbose=verbose)
         loss = scene.compute_global_alignment(init=None, niter=int(niter), schedule=schedule, lr=lr)
     else:
         import dust3r.cloud_opt.init_im_poses as init_fun
 
         init_fun.init_minimum_spanning_tree(scene)
         depth_init_meta = _preset_initial_depthmaps(scene, frame_ids, depth_initialization)
+        if depth_init_meta.get("num_depth_init", 0) > 0:
+            _reinit_pw_poses_from_current_depths(scene, verbose=verbose)
+        if _resolved_frozen:
+            frozen_depth_meta = _freeze_anchor_depthmaps(scene, frame_ids, _resolved_frozen, verbose=verbose)
         loss = scene.compute_global_alignment(init=None, niter=int(niter), schedule=schedule, lr=lr)
 
     state = extract_alignment_state(scene, frame_ids, loss=loss)
+
+    # For frozen anchor frames, overwrite pointmaps with coarse teacher values
+    # so the output state exactly inherits the coarse geometry.
+    if frozen_depth_meta.get("enabled") and coarse_pointmap_teacher:
+        for fid in frozen_depth_meta["frozen_frame_ids"]:
+            if fid in coarse_pointmap_teacher:
+                state["global_pointmaps"][fid] = np.asarray(coarse_pointmap_teacher[fid], dtype=np.float32).copy()
+            if depth_initialization and fid in depth_initialization:
+                state["depths"][fid] = np.asarray(depth_initialization[fid], dtype=np.float32).copy()
+
     if resolved_camera_anchor_mode == "fixed":
         # Keep exported/compared poses byte-for-byte tied to the source camera
         # convention instead of a quaternion round-trip inside the optimizer.
@@ -550,6 +649,7 @@ def run_monst3r_alignment(
     }
     if static_mask_meta is not None:
         state["static_loss_masking"] = static_mask_meta
+    state["frozen_depth"] = frozen_depth_meta
     return state
 
 

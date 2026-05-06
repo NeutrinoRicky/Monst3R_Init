@@ -1,9 +1,9 @@
-
+import os
 import sys
 import argparse
 import torch
 import json
-from os.path import dirname, join
+from os.path import basename, dirname, isfile, join
 RAFT_PATH_ROOT = join(dirname(__file__), 'RAFT')
 RAFT_PATH_CORE = join(RAFT_PATH_ROOT, 'core')
 sys.path.append(RAFT_PATH_CORE)
@@ -36,7 +36,49 @@ def get_input_padder(shape):
     return InputPadder(shape, mode='sintel')
 
 
+def _resolve_repo_path(*parts):
+    return join(dirname(dirname(__file__)), *parts)
+
+
+def resolve_raft_model_path(model_path=None):
+    env_override = os.environ.get("MONST3R_RAFT_CKPT")
+    if env_override and isfile(env_override):
+        return env_override
+
+    candidates = []
+    if model_path and isfile(model_path):
+        return model_path
+
+    model_name = basename(model_path) if model_path else "raft-sintel.pth"
+    if model_path:
+        candidates.extend(
+            [
+                _resolve_repo_path("ckpt", "RAFT", model_name),
+                _resolve_repo_path("third_party", "RAFT", "models", model_name),
+            ]
+        )
+
+    candidates.extend(
+        [
+            _resolve_repo_path("ckpt", "RAFT", "raft-sintel.pth"),
+            join(RAFT_PATH_ROOT, "models", "raft-sintel.pth"),
+        ]
+    )
+
+    for candidate in candidates:
+        if candidate and isfile(candidate):
+            return candidate
+
+    missing = model_path if model_path else join(RAFT_PATH_ROOT, "models", "raft-sintel.pth")
+    raise FileNotFoundError(
+        "Could not resolve a RAFT checkpoint. Tried the requested path, "
+        "the local ckpt/RAFT directory, and third_party/RAFT/models.\n"
+        f"Requested: {missing}"
+    )
+
+
 def load_RAFT(model_path=None):
+    model_path = resolve_raft_model_path(model_path)
     if model_path is None or 'M' not in model_path: # RAFT1
         parser = argparse.ArgumentParser()
         parser.add_argument('--model', help="restore checkpoint", default=model_path)
@@ -49,7 +91,7 @@ def load_RAFT(model_path=None):
         
         # Set default value for --model if model_path is provided
         args = parser.parse_args(
-            ['--model', model_path if model_path else join(RAFT_PATH_ROOT, 'models', 'raft-sintel.pth'), '--path', './'])
+            ['--model', model_path, '--path', './'])
         
         net = RAFT(args)
     else: # RAFT2

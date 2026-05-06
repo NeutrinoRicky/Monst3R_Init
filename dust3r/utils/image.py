@@ -144,10 +144,61 @@ def crop_img(img, size, square_ok=False, nearest=False, crop=True):
             img = img.resize((2*halfw, 2*halfh), PIL.Image.LANCZOS)
     return img
 
-def load_images(folder_or_list, size, square_ok=False, verbose=True, dynamic_mask_root=None, crop=True, fps=0, num_frames=110, imgs=None):
+
+def _infer_dynamic_mask_root(mask_parent, dynamic_mask_root=None):
+    if dynamic_mask_root is not None or mask_parent is None:
+        return dynamic_mask_root
+
+    for candidate_name in ("mask", "masks", "dynamic_mask", "dynamic_masks"):
+        candidate_dir = Path(mask_parent) / candidate_name
+        if candidate_dir.is_dir():
+            return str(candidate_dir)
+    return dynamic_mask_root
+
+
+def _resolve_image_input(folder_or_list, dynamic_mask_root=None):
+    """Handle scene roots or image folders with sibling dynamic-mask directories."""
+    if not isinstance(folder_or_list, str) or not os.path.isdir(folder_or_list):
+        return folder_or_list, dynamic_mask_root
+
+    root_path = Path(folder_or_list)
+    images_dir = root_path / "images"
+    if images_dir.is_dir():
+        inferred_mask_root = _infer_dynamic_mask_root(root_path, dynamic_mask_root)
+        return str(images_dir), inferred_mask_root
+
+    inferred_mask_root = _infer_dynamic_mask_root(root_path, dynamic_mask_root)
+    inferred_mask_root = _infer_dynamic_mask_root(root_path.parent, inferred_mask_root)
+    return folder_or_list, inferred_mask_root
+
+
+def _find_dynamic_mask_path(dynamic_mask_root, image_path, supported_extensions):
+    if dynamic_mask_root is None:
+        return None
+
+    image_name = os.path.basename(str(image_path))
+    image_stem = Path(image_name).stem
+    candidate_paths = [os.path.join(dynamic_mask_root, image_name)]
+    for ext in supported_extensions:
+        candidate_paths.append(os.path.join(dynamic_mask_root, image_stem + ext))
+
+    seen = set()
+    for candidate_path in candidate_paths:
+        if candidate_path in seen:
+            continue
+        seen.add(candidate_path)
+        if os.path.exists(candidate_path):
+            return candidate_path
+    return None
+
+
+def load_images(folder_or_list, size, square_ok=False, verbose=True, dynamic_mask_root=None, crop=True,
+                fps=0, num_frames=110, frame_stride=1, imgs=None):
     """Open and convert all images or videos in a list or folder to proper input format for DUSt3R."""
     if imgs is None:
         imgs = []
+    folder_or_list, dynamic_mask_root = _resolve_image_input(folder_or_list, dynamic_mask_root)
+    frame_stride = max(int(frame_stride), 1)
     if isinstance(folder_or_list, str):
         if verbose:
             print(f'>> Loading images from {folder_or_list}')
@@ -174,6 +225,10 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True, dynamic_mas
 
     # Sort items by their names
     folder_content = sorted(folder_content, key=lambda x: x.split('/')[-1])
+    if frame_stride > 1:
+        folder_content = folder_content[::frame_stride]
+        if verbose:
+            print(f' - Applying frame stride {frame_stride}: keeping {len(folder_content)} items')
     for path in folder_content:
         full_path = os.path.join(root, path)
         if path.lower().endswith(supported_images_extensions):
@@ -195,20 +250,27 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True, dynamic_mas
             )
             
             if dynamic_mask_root is not None:
-                dynamic_mask_path = os.path.join(dynamic_mask_root, os.path.basename(path))
+                dynamic_mask_path = _find_dynamic_mask_path(
+                    dynamic_mask_root,
+                    path,
+                    supported_images_extensions,
+                )
             else:  # Sintel dataset handling
-                dynamic_mask_path = full_path.replace('final', 'dynamic_label_perfect').replace('clean', 'dynamic_label_perfect')
+                sintel_mask_path = full_path.replace('final', 'dynamic_label_perfect').replace('clean', 'dynamic_label_perfect')
+                dynamic_mask_path = sintel_mask_path if sintel_mask_path != full_path else None
 
-            if os.path.exists(dynamic_mask_path):
+            if dynamic_mask_path is not None and os.path.exists(dynamic_mask_path):
                 dynamic_mask = PIL.Image.open(dynamic_mask_path).convert('L')
-                dynamic_mask = crop_img(dynamic_mask, size, square_ok=square_ok)
-                dynamic_mask = ToTensor(dynamic_mask)[None].sum(1) > 0.99  # "1" means dynamic
+                dynamic_mask = crop_img(dynamic_mask, size, square_ok=square_ok, nearest=True, crop=crop)
+                dynamic_mask = ToTensor(dynamic_mask)[None].sum(1) > 0.5  # robust to JPEG-compressed binary masks
                 if dynamic_mask.sum() < 0.8 * dynamic_mask.numel():  # Consider static if over 80% is dynamic
                     single_dict['dynamic_mask'] = dynamic_mask
                 else:
                     single_dict['dynamic_mask'] = torch.zeros_like(single_dict['mask'])
+                single_dict['has_dynamic_mask'] = True
             else:
                 single_dict['dynamic_mask'] = torch.zeros_like(single_dict['mask'])
+                single_dict['has_dynamic_mask'] = False
 
             imgs.append(single_dict)
 
@@ -233,6 +295,8 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True, dynamic_mas
             else:
                 frame_interval = 1
             frame_indices = list(range(0, total_frames, frame_interval))
+            if frame_stride > 1:
+                frame_indices = frame_indices[::frame_stride]
             if num_frames is not None:
                 frame_indices = frame_indices[:num_frames]
 

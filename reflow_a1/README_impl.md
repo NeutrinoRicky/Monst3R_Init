@@ -293,14 +293,26 @@ CUDA_VISIBLE_DEVICES=3 python run_coarse_debug.py \
 
 CUDA_VISIBLE_DEVICES=3 python run_coarse_debug.py \
   --scene_root /mnt/store/fd/project/dataset/HyperNeRF/vrig/broom-single \
-  --clip_len 10 \
-  --coarse_max_offset 9 \
+  --clip_len 5 \
+  --coarse_max_offset 4 \
   --weights /mnt/store/fd/project/DynamicReconstruction/monst3r/ckpt/model.safetensors \
   --output_dir /mnt/store/fd/project/dataset/HyperNeRF/vrig/broom-single/monst3r_reflow_a1_coarse_debug_offset_filter_new \
-  --niter_coarse 1500 \
+  --niter_coarse 3000 \
   --lr 0.05 \
   --coarse_voxel_keep_max_conf \
   --coarse_voxel_size 0.5
+
+CUDA_VISIBLE_DEVICES=2 python /mnt/store/fd/project/DynamicReconstruction/monst3r/reflow_a1/run_coarse_all.py \
+  --scene_root /mnt/store/fd/project/dataset/HyperNeRF/vrig/broom-single \
+  --clip_len 5 \
+  --coarse_max_offset 4 \
+  --weights /mnt/store/fd/project/DynamicReconstruction/monst3r/ckpt/model.safetensors \
+  --output_dir /mnt/store/fd/project/dataset/HyperNeRF/vrig/broom-single/monst3r_reflow_a1_coarse_debug_offset_filter_new \
+  --niter_coarse 3000 \
+  --lr 0.05 \
+  --coarse_voxel_keep_max_conf \
+  --coarse_voxel_size 0.35
+
 ```
 
 Optional post-export voxel filtering for `coarse_keyframes.ply`:
@@ -333,8 +345,8 @@ CUDA_VISIBLE_DEVICES=0 python run_fine_debug.py \
   --weights /mnt/store/fd/project/DynamicReconstruction/monst3r/ckpt/model.safetensors \
   --niter_coarse 1500 \
   --lr 0.05 \
-  --niter_fine 500 \
-  --lr_fine 0.02 \
+  --niter_fine 1500 \
+  --lr_fine 0.05 \
   --fine_camera_anchor_mode fixed \
   --dynamic_min_confidence 5.0 \
   --output_dir /mnt/store/fd/project/dataset/HyperNeRF/vrig/broom-single/monst3r_reflow_a1_fine_debug_v2

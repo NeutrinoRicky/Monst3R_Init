@@ -1045,7 +1045,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         niter=args.niter_coarse,
         schedule=args.schedule,
         lr=args.lr,
-        force_recompute_pairs=args.force_recompute_pairs,
+        force_recompute_pairs=True,
         verbose=True,
     )
     print(
@@ -1162,7 +1162,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             coarse_pointmap_teacher_weight=args.fine_coarse_pointmap_teacher_weight,
             coarse_depth_teacher_weight=args.fine_coarse_depth_teacher_weight,
             coarse_teacher_min_confidence=args.fine_coarse_teacher_min_confidence,
-            force_recompute_pairs=args.force_recompute_pairs,
+            force_recompute_pairs=True,
             verbose=True,
         )
         clip_state["debug_graph_clip_index"] = int(graph_clip_index)

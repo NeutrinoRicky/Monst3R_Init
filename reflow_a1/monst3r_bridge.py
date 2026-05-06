@@ -24,5 +24,12 @@ def ensure_monst3r_imports() -> Path:
 
 
 def default_weights_path() -> Path:
-    return repo_root() / "checkpoints" / "MonST3R_PO-TA-S-W_ViTLarge_BaseDecoder_512_dpt.pth"
-
+    root = repo_root()
+    candidates = [
+        root / "ckpt" / "model.safetensors",
+        root / "checkpoints" / "MonST3R_PO-TA-S-W_ViTLarge_BaseDecoder_512_dpt.pth",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]

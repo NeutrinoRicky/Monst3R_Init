@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -163,10 +164,12 @@ class PointCloudOptimizer(BasePCOptimizer):
             self.flow_ji.requires_grad_(False)
             self.flow_valid_mask_i.requires_grad_(False)
             self.flow_valid_mask_j.requires_grad_(False)
-            if sam2_mask_refine: 
+            if sam2_mask_refine and os.path.exists(sam2_checkpoint):
                 with torch.no_grad():
                     self.refine_motion_mask_w_sam2()
             else:
+                if sam2_mask_refine and self.verbose and not os.path.exists(sam2_checkpoint):
+                    print(f"Skipping SAM2 mask refinement because checkpoint is missing: {sam2_checkpoint}")
                 self.sam2_dynamic_masks = None
 
     def _validate_prev_results(self):
